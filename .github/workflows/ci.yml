@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t s3-2q:ci .
+      - name: run against a 64 MiB tmpfs
+        run: |
+          docker run -d --name s3-2q -p 7070:7070 -p 7071:7071 --tmpfs /data:size=64m \
+            -e ROOT_ACCESS_KEY=admin -e ROOT_SECRET_KEY=adminsecret s3-2q:ci \
+            -data-dir /data -access-log /state/access.log -listen :7071 \
+            -high 70 -low 50 -min-age 2s -interval 1s \
+            -- versitygw --port :7070 --access-log /state/access.log posix /data
+          scripts/e2e.sh
+      - if: always()
+        run: docker logs s3-2q 2>&1 | grep s3-2q | tail -50
