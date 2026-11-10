@@ -1,9 +1,13 @@
 package evictor
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -294,5 +298,79 @@ func TestGhostSurvivesOwnDeleteAndMiss(t *testing.T) {
 	e.Handle(rec("s3_PutObject", "a", 200, 50))
 	if st := e.Status().Index; st.AmKeys != 1 || st.A1inKeys != 1 || st.GhostKeys != 0 {
 		t.Fatalf("index %+v", st)
+	}
+}
+
+func TestSnapshotBinaryPreservesEntries(t *testing.T) {
+	e := newTest(newFake(100))
+	e.mu.Lock()
+	for i, k := range []twoq.Key{{Bucket: "bkt", Object: "a b/ü.txt"}, {Bucket: "other", Object: "x"}, {Bucket: "bkt", Object: "ghost"}, {Bucket: "bkt", Object: ""}} {
+		e.idx.Put(k, int64(i+1))
+	}
+	e.idx.Access(twoq.Key{Bucket: "other", Object: "x"})
+	e.idx.Evicted(twoq.Key{Bucket: "bkt", Object: "ghost"})
+	e.idx.SeedCold(twoq.Key{Bucket: "bkt", Object: "seeded"}, 9, time.Time{})
+	want := e.idx.Snapshot()
+	e.mu.Unlock()
+	path := filepath.Join(t.TempDir(), "snap.gz")
+	if err := e.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	e2 := newTest(newFake(100))
+	if n, err := e2.LoadSnapshot(path); err != nil || n != len(want) {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	got := e2.idx.Snapshot()
+	for i := range want {
+		if w, g := want[i], got[i]; w.Bucket != g.Bucket || w.Object != g.Object || w.Size != g.Size ||
+			w.Queue != g.Queue || !w.LastAccess.Equal(g.LastAccess) {
+			t.Fatalf("entry %d: got %+v want %+v", i, g, w)
+		}
+	}
+}
+
+func TestSnapshotLegacyJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.gz")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := gzip.NewWriter(f)
+	enc := json.NewEncoder(zw)
+	ts := time.Unix(1000, 0)
+	for _, en := range []twoq.SnapshotEntry{
+		{Bucket: "bkt", Object: "a", Size: 3, Queue: twoq.A1in, LastAccess: ts},
+		{Bucket: "bkt", Object: "b", Size: 4, Queue: twoq.Am, LastAccess: ts},
+	} {
+		enc.Encode(en)
+	}
+	zw.Close()
+	f.Close()
+	e := newTest(newFake(100))
+	if n, err := e.LoadSnapshot(path); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if st := e.Status().Index; st.A1inKeys != 1 || st.AmKeys != 1 || st.A1inBytes != 3 {
+		t.Fatalf("index %+v", st)
+	}
+}
+
+func TestSnapshotTruncated(t *testing.T) {
+	e := newTest(newFake(100))
+	e.Handle(rec("s3_PutObject", "a", 200, 3))
+	path := filepath.Join(t.TempDir(), "snap.gz")
+	if err := e.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	zr, _ := gzip.NewReader(bytes.NewReader(raw))
+	plain, _ := io.ReadAll(zr)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(plain[:len(plain)-2])
+	zw.Close()
+	os.WriteFile(path, buf.Bytes(), 0o644)
+	if _, err := newTest(newFake(100)).LoadSnapshot(path); err == nil {
+		t.Fatal("expected error for truncated snapshot")
 	}
 }

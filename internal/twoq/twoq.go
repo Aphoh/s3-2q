@@ -12,7 +12,7 @@
 package twoq
 
 import (
-	"container/list"
+	"math"
 	"time"
 )
 
@@ -42,7 +42,7 @@ type Key struct {
 	Object string
 }
 
-// Entry is a tracked object. Size is -1 when unknown.
+// Entry is a copy of a tracked object. Size is -1 when unknown.
 type Entry struct {
 	Key
 	Size       int64
@@ -78,36 +78,117 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// node is an intrusive list element, so each key costs one allocation.
+type node struct {
+	key        Key
+	size       int64
+	last       int64 // unix nanos; noTime if unknown
+	prev, next *node
+	queue      Queue
+	epoch      uint32 // last sweep that saw this key
+}
+
+const noTime = math.MinInt64
+
+// nanos converts t to unix nanos, saturating outside the int64 range
+// (roughly years 1678-2262).
+func nanos(t time.Time) int64 {
+	switch sec := t.Unix(); {
+	case t.IsZero():
+		return noTime
+	case sec >= math.MaxInt64/int64(time.Second):
+		return math.MaxInt64
+	case sec <= math.MinInt64/int64(time.Second):
+		return noTime + 1
+	}
+	return t.UnixNano()
+}
+
+func (n *node) entry() Entry {
+	e := Entry{Key: n.key, Size: n.size, queue: n.queue}
+	if n.last != noTime {
+		e.LastAccess = time.Unix(0, n.last)
+	}
+	return e
+}
+
+// queue is a doubly linked list; front = newest / most recently used.
+type queue struct {
+	front, back *node
+	len         int
+	bytes       int64
+}
+
+func (q *queue) pushFront(n *node) {
+	n.prev, n.next = nil, q.front
+	if q.front != nil {
+		q.front.prev = n
+	} else {
+		q.back = n
+	}
+	q.front = n
+	q.len++
+	q.bytes += knownSize(n.size)
+}
+
+func (q *queue) pushBack(n *node) {
+	n.prev, n.next = q.back, nil
+	if q.back != nil {
+		q.back.next = n
+	} else {
+		q.front = n
+	}
+	q.back = n
+	q.len++
+	q.bytes += knownSize(n.size)
+}
+
+func (q *queue) remove(n *node) {
+	if n.prev != nil {
+		n.prev.next = n.next
+	} else {
+		q.front = n.next
+	}
+	if n.next != nil {
+		n.next.prev = n.prev
+	} else {
+		q.back = n.prev
+	}
+	n.prev, n.next = nil, nil
+	q.len--
+	q.bytes -= knownSize(n.size)
+}
+
+func (q *queue) moveToFront(n *node) {
+	if q.front != n {
+		q.remove(n)
+		q.pushFront(n)
+	}
+}
+
 type Index struct {
-	cfg                Config
-	a1in, am, a1out    *list.List // front = newest / most recently used
-	items              map[Key]*list.Element
-	a1inBytes, amBytes int64
-	now                func() time.Time
+	cfg             Config
+	a1in, am, a1out queue
+	items           map[Key]*node
+	epoch           uint32
+	now             func() time.Time
 }
 
 func New(cfg Config) *Index {
-	return &Index{
-		cfg:   cfg.withDefaults(),
-		a1in:  list.New(),
-		am:    list.New(),
-		a1out: list.New(),
-		items: make(map[Key]*list.Element),
-		now:   time.Now,
-	}
+	return &Index{cfg: cfg.withDefaults(), items: make(map[Key]*node), now: time.Now}
 }
 
 // SetClock overrides the time source (for tests).
 func (x *Index) SetClock(now func() time.Time) { x.now = now }
 
-func (x *Index) list(q Queue) *list.List {
+func (x *Index) queue(q Queue) *queue {
 	switch q {
 	case A1in:
-		return x.a1in
+		return &x.a1in
 	case Am:
-		return x.am
+		return &x.am
 	case A1out:
-		return x.a1out
+		return &x.a1out
 	}
 	return nil
 }
@@ -119,66 +200,66 @@ func knownSize(s int64) int64 {
 	return s
 }
 
-func (x *Index) addBytes(q Queue, n int64) {
-	switch q {
-	case A1in:
-		x.a1inBytes += n
-	case Am:
-		x.amBytes += n
+func (x *Index) unlink(n *node) {
+	x.queue(n.queue).remove(n)
+	delete(x.items, n.key)
+	n.queue = None
+}
+
+// move takes n out of its queue and puts it at the front of q.
+func (x *Index) move(n *node, q Queue) {
+	x.queue(n.queue).remove(n)
+	n.queue = q
+	x.queue(q).pushFront(n)
+}
+
+func (x *Index) insert(q Queue, n *node, front bool) {
+	n.queue = q
+	x.items[n.key] = n
+	if front {
+		x.queue(q).pushFront(n)
+	} else {
+		x.queue(q).pushBack(n)
 	}
 }
 
-func (x *Index) unlink(el *list.Element) *Entry {
-	e := el.Value.(*Entry)
-	x.list(e.queue).Remove(el)
-	x.addBytes(e.queue, -knownSize(e.Size))
-	delete(x.items, e.Key)
-	e.queue = None
-	return e
-}
-
-func (x *Index) pushFront(q Queue, e *Entry) {
-	e.queue = q
-	x.items[e.Key] = x.list(q).PushFront(e)
-	x.addBytes(q, knownSize(e.Size))
-}
-
-func (x *Index) pushBack(q Queue, e *Entry) {
-	e.queue = q
-	x.items[e.Key] = x.list(q).PushBack(e)
-	x.addBytes(q, knownSize(e.Size))
+// setSize updates n's size and its queue's byte count.
+func (x *Index) setSize(n *node, size int64) {
+	if q := x.queue(n.queue); q != nil {
+		q.bytes += knownSize(size) - knownSize(n.size)
+	}
+	n.size = size
 }
 
 // Get returns a copy of the entry for k.
 func (x *Index) Get(k Key) (Entry, bool) {
-	el, ok := x.items[k]
+	n, ok := x.items[k]
 	if !ok {
 		return Entry{}, false
 	}
-	return *el.Value.(*Entry), true
+	return n.entry(), true
 }
 
 // Put records a write of k. size < 0 means unknown.
 func (x *Index) Put(k Key, size int64) {
-	now := x.now()
-	if el, ok := x.items[k]; ok {
-		e := el.Value.(*Entry)
-		switch e.queue {
+	now := nanos(x.now())
+	if n, ok := x.items[k]; ok {
+		switch n.queue {
 		case A1in, Am:
-			x.addBytes(e.queue, knownSize(size)-knownSize(e.Size))
-			e.Size = size
-			e.LastAccess = now
-			if e.queue == Am {
-				x.am.MoveToFront(el)
+			x.setSize(n, size)
+			n.last = now
+			if n.queue == Am {
+				x.am.moveToFront(n)
 			}
 			return
 		case A1out:
-			x.unlink(el)
-			x.pushFront(Am, &Entry{Key: k, Size: size, LastAccess: now})
+			x.a1out.remove(n)
+			n.size, n.last, n.queue = size, now, Am
+			x.am.pushFront(n)
 			return
 		}
 	}
-	x.pushFront(A1in, &Entry{Key: k, Size: size, LastAccess: now})
+	x.insert(A1in, &node{key: k, size: size, last: now}, true)
 	x.trimGhost()
 }
 
@@ -186,21 +267,19 @@ func (x *Index) Put(k Key, size int64) {
 // ghost keys are left untouched so the caller can decide how to learn about
 // them (e.g. via Put once the size is known).
 func (x *Index) Access(k Key) bool {
-	el, ok := x.items[k]
+	n, ok := x.items[k]
 	if !ok {
 		return false
 	}
-	e := el.Value.(*Entry)
-	switch e.queue {
+	switch n.queue {
 	case Am:
-		e.LastAccess = x.now()
-		x.am.MoveToFront(el)
+		n.last = nanos(x.now())
+		x.am.moveToFront(n)
 		return true
 	case A1in:
-		e.LastAccess = x.now()
+		n.last = nanos(x.now())
 		if x.cfg.PromoteOnA1inHit {
-			x.unlink(el)
-			x.pushFront(Am, e)
+			x.move(n, Am)
 		}
 		return true
 	}
@@ -209,22 +288,15 @@ func (x *Index) Access(k Key) bool {
 
 // SetSize fills in the size of a resident key.
 func (x *Index) SetSize(k Key, size int64) {
-	el, ok := x.items[k]
-	if !ok {
-		return
+	if n, ok := x.items[k]; ok && (n.queue == A1in || n.queue == Am) {
+		x.setSize(n, size)
 	}
-	e := el.Value.(*Entry)
-	if e.queue != A1in && e.queue != Am {
-		return
-	}
-	x.addBytes(e.queue, knownSize(size)-knownSize(e.Size))
-	e.Size = size
 }
 
 // Remove forgets k entirely (explicit delete); it does not enter A1out.
 func (x *Index) Remove(k Key) {
-	if el, ok := x.items[k]; ok {
-		x.unlink(el)
+	if n, ok := x.items[k]; ok {
+		x.unlink(n)
 	}
 }
 
@@ -232,18 +304,16 @@ func (x *Index) Remove(k Key) {
 // accessed at or after notBefore are protected; ok is false when no
 // eligible victim exists.
 func (x *Index) Victim(notBefore time.Time) (Entry, bool) {
-	order := []*list.List{x.am, x.a1in}
-	total := x.a1inBytes + x.amBytes
-	if x.am.Len() == 0 || float64(x.a1inBytes) > x.cfg.KinRatio*float64(total) ||
-		(total == 0 && x.a1in.Len() > 0) {
-		order = []*list.List{x.a1in, x.am}
+	first, second := &x.am, &x.a1in
+	total := x.a1in.bytes + x.am.bytes
+	if x.am.len == 0 || float64(x.a1in.bytes) > x.cfg.KinRatio*float64(total) ||
+		(total == 0 && x.a1in.len > 0) {
+		first, second = second, first
 	}
-	for _, l := range order {
-		if el := l.Back(); el != nil {
-			e := el.Value.(*Entry)
-			if e.LastAccess.Before(notBefore) {
-				return *e, true
-			}
+	cutoff := nanos(notBefore)
+	for _, q := range [2]*queue{first, second} {
+		if n := q.back; n != nil && n.last < cutoff {
+			return n.entry(), true
 		}
 	}
 	return Entry{}, false
@@ -252,21 +322,22 @@ func (x *Index) Victim(notBefore time.Time) (Entry, bool) {
 // Evicted records that k was removed to free space. A1in keys are kept in
 // A1out as ghosts.
 func (x *Index) Evicted(k Key) {
-	el, ok := x.items[k]
+	n, ok := x.items[k]
 	if !ok {
 		return
 	}
-	fromA1in := el.Value.(*Entry).queue == A1in
-	e := x.unlink(el)
-	if fromA1in {
-		e.Size = -1
-		x.pushFront(A1out, e)
-		x.trimGhost()
+	if n.queue != A1in {
+		x.unlink(n)
+		return
 	}
+	x.a1in.remove(n)
+	n.size, n.queue = -1, A1out
+	x.a1out.pushFront(n)
+	x.trimGhost()
 }
 
 func (x *Index) ghostCap() int {
-	n := int(x.cfg.GhostRatio * float64(x.a1in.Len()+x.am.Len()))
+	n := int(x.cfg.GhostRatio * float64(x.a1in.len+x.am.len))
 	if n < x.cfg.MinGhost {
 		n = x.cfg.MinGhost
 	}
@@ -274,8 +345,8 @@ func (x *Index) ghostCap() int {
 }
 
 func (x *Index) trimGhost() {
-	for limit := x.ghostCap(); x.a1out.Len() > limit; {
-		x.unlink(x.a1out.Back())
+	for limit := x.ghostCap(); x.a1out.len > limit; {
+		x.unlink(x.a1out.back)
 	}
 }
 
@@ -288,14 +359,14 @@ type Stats struct {
 }
 
 func (x *Index) Stats() Stats {
-	return Stats{x.a1in.Len(), x.a1inBytes, x.am.Len(), x.amBytes, x.a1out.Len()}
+	return Stats{x.a1in.len, x.a1in.bytes, x.am.len, x.am.bytes, x.a1out.len}
 }
 
 // Resident calls fn for every A1in and Am entry.
 func (x *Index) Resident(fn func(Entry)) {
-	for _, l := range []*list.List{x.a1in, x.am} {
-		for el := l.Front(); el != nil; el = el.Next() {
-			fn(*el.Value.(*Entry))
+	for _, q := range [2]*queue{&x.a1in, &x.am} {
+		for n := q.front; n != nil; n = n.next {
+			fn(n.entry())
 		}
 	}
 }
@@ -303,16 +374,50 @@ func (x *Index) Resident(fn func(Entry)) {
 // SeedCold adds k to the cold end of A1in if it is not resident. Ghost
 // entries for k are dropped. Used when discovering existing objects.
 func (x *Index) SeedCold(k Key, size int64, lastAccess time.Time) {
-	if el, ok := x.items[k]; ok {
-		if el.Value.(*Entry).queue != A1out {
+	if n, ok := x.items[k]; ok {
+		if n.queue != A1out {
 			return
 		}
-		x.unlink(el)
+		x.a1out.remove(n)
+		n.size, n.last, n.queue = size, nanos(lastAccess), A1in
+		x.a1in.pushBack(n)
+		return
 	}
-	x.pushBack(A1in, &Entry{Key: k, Size: size, LastAccess: lastAccess})
+	x.insert(A1in, &node{key: k, size: size, last: nanos(lastAccess)}, false)
 }
 
-// SnapshotEntry is one line of a persisted index, newest first per queue.
+// BeginSweep starts a mark-and-sweep pass used to drop keys that no longer
+// exist: call Seen for every existing key, then Sweep.
+func (x *Index) BeginSweep() { x.epoch++ }
+
+// Seen marks k as existing in the current sweep and returns its entry.
+func (x *Index) Seen(k Key) (Entry, bool) {
+	n, ok := x.items[k]
+	if !ok {
+		return Entry{}, false
+	}
+	n.epoch = x.epoch
+	return n.entry(), true
+}
+
+// Sweep removes resident keys not marked by Seen since BeginSweep and last
+// accessed before notBefore. It returns how many were removed.
+func (x *Index) Sweep(notBefore time.Time) int {
+	cutoff, removed := nanos(notBefore), 0
+	for _, q := range [2]*queue{&x.a1in, &x.am} {
+		for n := q.front; n != nil; {
+			next := n.next
+			if n.epoch != x.epoch && n.last < cutoff {
+				x.unlink(n)
+				removed++
+			}
+			n = next
+		}
+	}
+	return removed
+}
+
+// SnapshotEntry is one entry of a persisted index, newest first per queue.
 type SnapshotEntry struct {
 	Bucket     string    `json:"b"`
 	Object     string    `json:"k"`
@@ -324,9 +429,9 @@ type SnapshotEntry struct {
 // Snapshot returns all entries, front to back for each queue.
 func (x *Index) Snapshot() []SnapshotEntry {
 	out := make([]SnapshotEntry, 0, len(x.items))
-	for _, l := range []*list.List{x.a1in, x.am, x.a1out} {
-		for el := l.Front(); el != nil; el = el.Next() {
-			e := el.Value.(*Entry)
+	for _, q := range [3]*queue{&x.a1in, &x.am, &x.a1out} {
+		for n := q.front; n != nil; n = n.next {
+			e := n.entry()
 			out = append(out, SnapshotEntry{e.Bucket, e.Object, e.Size, e.queue, e.LastAccess})
 		}
 	}
@@ -335,12 +440,15 @@ func (x *Index) Snapshot() []SnapshotEntry {
 
 // Restore appends snapshot entries in order. Call on an empty index.
 func (x *Index) Restore(entries []SnapshotEntry) {
+	if len(x.items) == 0 {
+		x.items = make(map[Key]*node, len(entries))
+	}
 	for _, s := range entries {
 		k := Key{s.Bucket, s.Object}
-		if _, dup := x.items[k]; dup || x.list(s.Queue) == nil {
+		if _, dup := x.items[k]; dup || x.queue(s.Queue) == nil {
 			continue
 		}
-		x.pushBack(s.Queue, &Entry{Key: k, Size: s.Size, LastAccess: s.LastAccess})
+		x.insert(s.Queue, &node{key: k, size: s.Size, last: nanos(s.LastAccess)}, false)
 	}
 	x.trimGhost()
 }

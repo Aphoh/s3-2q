@@ -73,6 +73,8 @@ Run `s3-2q -h` for the rest.
 
 ```sh
 go test -race ./...
+# microbenchmarks (parsing, tailing, index ops, memory per key, snapshot, reconcile at 1M keys):
+go test -run '^$' -bench . ./...
 # end to end on a small tmpfs (as in CI):
 docker run -d -p 7070:7070 -p 7071:7071 --tmpfs /data:size=64m -e ROOT_ACCESS_KEY=admin -e ROOT_SECRET_KEY=adminsecret \
   s3-2q -data-dir /data -access-log /state/access.log -listen :7071 -high 70 -low 50 -min-age 2s -interval 1s \

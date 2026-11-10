@@ -5,7 +5,8 @@ package evictor
 import (
 	"context"
 	"log/slog"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,8 +45,9 @@ type Evictor struct {
 	usage DiskUsage
 	log   *slog.Logger
 
-	mu  sync.Mutex
-	idx *twoq.Index
+	mu      sync.Mutex
+	idx     *twoq.Index
+	buckets map[string]string // interned bucket names
 
 	resolve   chan twoq.Key
 	reconcile chan struct{}
@@ -79,6 +81,7 @@ func New(cfg Config, store Store, usage DiskUsage, log *slog.Logger) *Evictor {
 		log:       log,
 		idx:       twoq.New(cfg.TwoQ),
 		resolve:   make(chan twoq.Key, 4096),
+		buckets:   make(map[string]string),
 		reconcile: make(chan struct{}, 1),
 	}
 }
@@ -131,7 +134,6 @@ func (e *Evictor) Handle(r accesslog.Record) {
 	e.stats.Records++
 	e.statsMu.Unlock()
 	ok := r.HTTPStatus >= 200 && r.HTTPStatus < 300
-	k := twoq.Key{Bucket: r.Bucket, Object: r.Key}
 
 	switch r.Operation {
 	case "s3_DeleteObjects":
@@ -161,13 +163,15 @@ func (e *Evictor) Handle(r accesslog.Record) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	k := twoq.Key{Bucket: e.intern(r.Bucket), Object: r.Key}
 	switch r.Operation {
 	case "s3_PutObject":
 		if ok {
-			e.idx.Put(k, r.ObjectSize)
+			e.idx.Put(owned(k), r.ObjectSize)
 		}
 	case "s3_CopyObject", "s3_CompleteMultipartUpload", "s3_PostObject":
 		if ok {
+			k = owned(k)
 			e.idx.Put(k, -1)
 			e.needSize(k)
 		}
@@ -181,6 +185,7 @@ func (e *Evictor) Handle(r accesslog.Record) {
 		case ok && !e.idx.Access(k):
 			// An object we did not know about (or a ghost written behind
 			// our back): learn it now.
+			k = owned(k)
 			e.idx.Put(k, -1)
 			e.needSize(k)
 		}
@@ -189,6 +194,23 @@ func (e *Evictor) Handle(r accesslog.Record) {
 			e.removeResident(k)
 		}
 	}
+}
+
+// intern returns a shared copy of bucket so index keys do not each hold
+// their own (or pin the log line it was parsed from). Requires e.mu.
+func (e *Evictor) intern(bucket string) string {
+	b, ok := e.buckets[bucket]
+	if !ok {
+		b = strings.Clone(bucket)
+		e.buckets[b] = b
+	}
+	return b
+}
+
+// owned copies k's object name, which may alias an access-log line, before
+// it is stored in the index.
+func owned(k twoq.Key) twoq.Key {
+	return twoq.Key{Bucket: k.Bucket, Object: strings.Clone(k.Object)}
 }
 
 // removeResident forgets a deleted object but keeps A1out ghosts: our own
@@ -217,42 +239,33 @@ func (e *Evictor) Reconcile(ctx context.Context) error {
 		mod  time.Time
 	}
 	var objs []obj
-	seen := make(map[twoq.Key]struct{})
 	for _, b := range buckets {
 		err := e.store.ListObjects(ctx, b, func(key string, size int64, mod time.Time) {
-			k := twoq.Key{Bucket: b, Object: key}
-			objs = append(objs, obj{k, size, mod})
-			seen[k] = struct{}{}
+			objs = append(objs, obj{twoq.Key{Bucket: b, Object: key}, size, mod})
 		})
 		if err != nil {
 			return err
 		}
 	}
 	// SeedCold appends to the back, so seed newest first.
-	sort.Slice(objs, func(i, j int) bool { return objs[i].mod.After(objs[j].mod) })
+	slices.SortFunc(objs, func(a, b obj) int { return b.mod.Compare(a.mod) })
 
 	e.mu.Lock()
-	added, removed := 0, 0
+	added := 0
+	e.idx.BeginSweep()
 	for _, o := range objs {
-		cur, ok := e.idx.Get(o.key)
+		cur, ok := e.idx.Seen(o.key)
 		switch {
 		case !ok || cur.Queue() == twoq.A1out:
+			o.key.Bucket = e.intern(o.key.Bucket)
 			e.idx.SeedCold(o.key, o.size, o.mod)
+			e.idx.Seen(o.key)
 			added++
 		case cur.Size != o.size:
 			e.idx.SetSize(o.key, o.size)
 		}
 	}
-	var gone []twoq.Key
-	e.idx.Resident(func(en twoq.Entry) {
-		if _, ok := seen[en.Key]; !ok && en.LastAccess.Before(start) {
-			gone = append(gone, en.Key)
-		}
-	})
-	for _, k := range gone {
-		e.idx.Remove(k)
-		removed++
-	}
+	removed := e.idx.Sweep(start)
 	st := e.idx.Stats()
 	e.mu.Unlock()
 
