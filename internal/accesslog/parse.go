@@ -3,12 +3,12 @@ package accesslog
 
 import (
 	"errors"
-	"net/url"
 	"strconv"
 	"strings"
 )
 
 // Record is the subset of a versitygw access-log line the evictor needs.
+// Its strings alias the parsed line; clone them before retaining.
 type Record struct {
 	Bucket     string
 	Key        string
@@ -31,29 +31,44 @@ func Parse(line string) (Record, error) {
 	if strings.HasPrefix(line, "log starts ") || line == "" {
 		return Record{}, errSkip
 	}
-	f := strings.Split(line, " ")
+	var buf [64]int
+	starts := append(buf[:0], 0) // byte offset of each field
+	for i := 0; i < len(line); i++ {
+		if line[i] == ' ' {
+			starts = append(starts, i+1)
+		}
+	}
+	field := func(i int) string {
+		end := len(line)
+		if i+1 < len(starts) {
+			end = starts[i+1] - 1
+		}
+		return line[starts[i]:end]
+	}
 	// owner bucket [date tz] ip requester reqid op = 8 tokens before the key.
 	const keyStart = 8
-	if len(f) < keyStart+8 || !strings.HasPrefix(f[2], "[") || !strings.HasSuffix(f[3], "]") {
+	if len(starts) < keyStart+8 || !strings.HasPrefix(field(2), "[") || !strings.HasSuffix(field(3), "]") {
 		return Record{}, errSkip
 	}
-	r := Record{Bucket: f[1], Operation: f[7]}
+	r := Record{Bucket: field(1), Operation: field(7)}
 	// Both the key and the user agent are client controlled and unquoted.
 	// Take the rightmost URI whose decoded path is exactly the bucket plus
 	// all tokens before it, since the real URI always follows the key.
-	for i := len(f) - 6; i > keyStart; i-- {
-		status, err := strconv.Atoi(f[i+1])
+	for i := len(starts) - 6; i > keyStart; i-- {
+		// strconv allocates an error per failed attempt, and most candidate
+		// fields are not numbers, so check digits first.
+		if !isUint(field(i+1)) || !isUint(field(i+3)) || !isUint(field(i+4)) {
+			continue
+		}
+		status, err := strconv.Atoi(field(i + 1))
 		if err != nil || status < 100 || status > 599 {
 			continue
 		}
-		size, err := strconv.ParseInt(f[i+4], 10, 64)
+		size, err := strconv.ParseInt(field(i+4), 10, 64)
 		if err != nil {
 			continue
 		}
-		if _, err := strconv.Atoi(f[i+3]); err != nil {
-			continue
-		}
-		key, ok := keyFromURI(f[i], r.Bucket, strings.Join(f[keyStart:i], " "))
+		key, ok := keyFromURI(field(i), r.Bucket, line[starts[keyStart]:starts[i]-1])
 		if !ok {
 			continue
 		}
@@ -68,23 +83,79 @@ func Parse(line string) (Record, error) {
 // URIs are accepted.
 func keyFromURI(uri, bucket, logged string) (string, bool) {
 	p, _, _ := strings.Cut(uri, "?")
-	p, err := url.PathUnescape(p)
-	if err != nil || !strings.HasPrefix(p, "/") {
+	if !strings.HasPrefix(p, "/") {
 		return "", false
 	}
 	if logged == "-" {
-		switch p {
-		case "/" + bucket + "/-", "/-":
+		switch {
+		case pathIs(p, "/", bucket, "/-"), pathIs(p, "/-"):
 			return "-", true
-		case "/" + bucket, "/" + bucket + "/", "/":
+		case pathIs(p, "/", bucket), pathIs(p, "/", bucket, "/"), p == "/":
 			return "", true
 		}
 		return "", false
 	}
-	if p == "/"+bucket+"/"+logged || p == "/"+logged {
+	if pathIs(p, "/", bucket, "/", logged) || pathIs(p, "/", logged) {
 		return logged, true
 	}
 	return "", false
+}
+
+// pathIs reports whether the percent-decoded escaped equals the
+// concatenation of want, without allocating.
+func pathIs(escaped string, want ...string) bool {
+	seg, j := 0, 0
+	next := func() (byte, bool) {
+		for seg < len(want) && j == len(want[seg]) {
+			seg, j = seg+1, 0
+		}
+		if seg == len(want) {
+			return 0, false
+		}
+		j++
+		return want[seg][j-1], true
+	}
+	for i := 0; i < len(escaped); i++ {
+		c := escaped[i]
+		if c == '%' {
+			if i+2 >= len(escaped) || !isHex(escaped[i+1]) || !isHex(escaped[i+2]) {
+				return false
+			}
+			c = unhex(escaped[i+1])<<4 | unhex(escaped[i+2])
+			i += 2
+		}
+		if w, ok := next(); !ok || w != c {
+			return false
+		}
+	}
+	_, more := next()
+	return !more
+}
+
+func isUint(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c <= '9':
+		return c - '0'
+	case c <= 'F':
+		return c - 'A' + 10
+	}
+	return c - 'a' + 10
 }
 
 // IsSkip reports whether err means the line is not an access record.

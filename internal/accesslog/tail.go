@@ -63,17 +63,22 @@ func (t *Tailer) Run(ctx context.Context, fn func(line string)) error {
 		}
 		if f != nil {
 			for {
-				b, err := r.ReadBytes('\n')
+				b, err := r.ReadSlice('\n')
 				offset += int64(len(b))
 				if err == nil {
 					if len(partial) > 0 {
-						b = append(partial, b...)
-						partial = nil
+						partial = append(partial, b...)
+						fn(string(partial))
+						partial = partial[:0]
+					} else {
+						fn(string(b))
 					}
-					fn(string(b))
 					continue
 				}
 				partial = append(partial, b...)
+				if errors.Is(err, bufio.ErrBufferFull) {
+					continue
+				}
 				if !errors.Is(err, io.EOF) {
 					return err
 				}

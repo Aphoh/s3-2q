@@ -2,6 +2,7 @@ package accesslog
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -140,4 +141,18 @@ func TestTailerWaitsForFile(t *testing.T) {
 	if got := c.waitFor(t, 1); got[0] != "first\n" {
 		t.Fatalf("got %q", got)
 	}
+}
+
+func FuzzPathIs(f *testing.F) {
+	for _, s := range [][2]string{{"/b/a%20b", "/b/a b"}, {"/b/%zz", "/b/%zz"}, {"/b/%2", "/b/%2"}, {"/b/x+y", "/b/x+y"}, {"/%C3%BC", "/ü"}} {
+		f.Add(s[0], s[1])
+	}
+	f.Fuzz(func(t *testing.T, escaped, want string) {
+		dec, err := url.PathUnescape(escaped)
+		exp := err == nil && dec == want
+		mid := len(want) / 2
+		if got := pathIs(escaped, want[:mid], "", want[mid:]); got != exp {
+			t.Fatalf("pathIs(%q, %q) = %v, want %v", escaped, want, got, exp)
+		}
+	})
 }
