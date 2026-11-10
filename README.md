@@ -17,13 +17,35 @@ remembered as a ghost, so if it is re-uploaded it goes straight to Am.
 
 ## Run it
 
+Prebuilt images (linux/amd64, linux/arm64) are on Docker Hub as
+[`aphoh/s3-2q`](https://hub.docker.com/r/aphoh/s3-2q).
+
+Demo: a 64 MiB tmpfs as the disk, evicting from 70% down to 50%:
+
 ```sh
-docker build -t s3-2q .
-docker run -p 7070:7070 -p 7071:7071 -v s3data:/data -v s3state:/state \
-  -e ROOT_ACCESS_KEY=admin -e ROOT_SECRET_KEY=change-me s3-2q
-aws --endpoint-url http://localhost:7070 s3 mb s3://bucket
-curl localhost:7071/status   # usage, evictions, queue sizes
+docker run --rm -p 7070:7070 -p 7071:7071 --tmpfs /data:size=64m \
+  -e ROOT_ACCESS_KEY=admin -e ROOT_SECRET_KEY=adminsecret \
+  aphoh/s3-2q -data-dir /data -access-log /state/access.log -listen :7071 \
+  -high 70 -low 50 -min-age 2s -interval 1s \
+  -- versitygw --port :7070 --access-log /state/access.log posix /data
+
+# in another shell
+export AWS_ACCESS_KEY_ID=admin AWS_SECRET_ACCESS_KEY=adminsecret AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://localhost:7070 s3 mb s3://demo
+head -c 4M /dev/urandom > obj
+for i in $(seq 1 20); do aws --endpoint-url http://localhost:7070 s3 cp obj s3://demo/obj-$i; done
+aws --endpoint-url http://localhost:7070 s3 ls s3://demo/   # oldest objects evicted
+curl localhost:7071/status                                  # usage, evictions, queue sizes
 ```
+
+For real use, keep data and state on volumes:
+
+```sh
+docker run -d -p 7070:7070 -p 7071:7071 -v s3data:/data -v s3state:/state \
+  -e ROOT_ACCESS_KEY=admin -e ROOT_SECRET_KEY=change-me aphoh/s3-2q
+```
+
+Or build it yourself with `docker build -t s3-2q .`
 
 `s3-2q` is the entrypoint and runs everything after `--` as its child
 (versitygw), forwarding signals and rotating the access log (rename + SIGHUP)
